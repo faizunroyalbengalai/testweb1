@@ -42,8 +42,7 @@ jobs:
         working-directory: terraform
         run: |
           terraform apply -auto-approve \
-            -var="public_key=${{ secrets.EC2_SSH_PUBLIC_KEY }}" \
-            -var="region=us-east-1"
+            -var="public_key=${{ secrets.EC2_SSH_PUBLIC_KEY }}"
 
       - name: Get server IP
         id: get_ip
