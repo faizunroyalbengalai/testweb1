@@ -1,197 +1,299 @@
 ---
-# Thin Ansible orchestrator for EC2.
-# All runtime-specific behavior lives in `runtimes/<runtime>/*.yml.j2` so that
-# editing one language's playbook (e.g. python) cannot affect any other.
-- name: Deploy testweb1
+- name: Deploy Python FastAPI app on EC2
   hosts: all
-  become: true
-  gather_facts: yes
+  become: yes
   vars:
-    ansible_ssh_retries: 5
     app_dir: /opt/app
+    app_user: ubuntu
+    python_version: "3.11"
+    gunicorn_entrypoint: "app.main:app"
+    gunicorn_workers: 4
     app_port: 8000
-    project: 'testweb1'
-    web_server: 'nginx'
-    python_version: '3.11'
-    entrypoint: 'app.main:app'
 
   tasks:
-    # ── System update ──────────────────────────────────────────────────────────
-    - name: Wait for SSH to be fully ready
-      wait_for_connection:
-        timeout: 120
-
     - name: Update apt cache
       apt:
         update_cache: yes
         cache_valid_time: 3600
-      retries: 3
-      delay: 10
-      register: _apt_update
-      until: _apt_update is succeeded
 
-    # ── Python runtime ────────────────────────────────────────────────────────
-    - name: Install pip and venv (system Python)
+    - name: Install system dependencies
       apt:
         name:
+          - python3.11
+          - python3.11-venv
           - python3-pip
-          - python3-venv
-          - python3-dev
+          - python3.11-dev
+          - git
+          - curl
+          - build-essential
+          - nginx
         state: present
 
-    - name: Install Python {{ python_version }} (try default repos first, deadsnakes as fallback)
-      block:
-        - name: Install from default apt repos
-          apt:
-            name:
-              - "python{{ python_version }}"
-              - "python{{ python_version }}-venv"
-              - "python{{ python_version }}-dev"
-            state: present
-            update_cache: yes
-      rescue:
-        - name: Add deadsnakes PPA via GPG key (older Ubuntu fallback)
-          shell: |
-            curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF23C5A6CF475977595C89F51BA6932366A755776" \
-              | gpg --dearmor --yes -o /usr/share/keyrings/deadsnakes.gpg
-            . /etc/os-release
-            echo "deb [signed-by=/usr/share/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu ${VERSION_CODENAME} main" \
-              | tee /etc/apt/sources.list.d/deadsnakes.list
-            apt-get update -qq
-          args:
-            executable: /bin/bash
-        - name: Install Python {{ python_version }} from deadsnakes
-          apt:
-            name:
-              - "python{{ python_version }}"
-              - "python{{ python_version }}-venv"
-              - "python{{ python_version }}-dev"
-            state: present
-            update_cache: yes
-      when: python_version not in ('3', '')
-
-
-    - name: Install Nginx
+    - name: Install PostgreSQL
+      when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
       apt:
-        name: nginx
+        name:
+          - postgresql
+          - postgresql-contrib
         state: present
-        update_cache: yes
 
-    - name: Configure Nginx reverse proxy
-      copy:
-        dest: /etc/nginx/sites-available/app
-        content: |
-          server {
-            listen 80;
-            server_name _;
-            location / {
-              proxy_pass http://127.0.0.1:{{ app_port }};
-              proxy_set_header Host $host;
-              proxy_set_header X-Real-IP $remote_addr;
-              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-              proxy_read_timeout 120s;
-            }
-          }
+    - name: Ensure PostgreSQL is started
+      when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
+      systemd:
+        name: postgresql
+        state: started
+        enabled: yes
 
-    - name: Enable Nginx site
-      file:
-        src: /etc/nginx/sites-available/app
-        dest: /etc/nginx/sites-enabled/app
-        state: link
+    - name: Fix PostgreSQL SCRAM auth to md5
+      when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
+      shell: |
+        PG_HBA=$(find /etc/postgresql -name pg_hba.conf | head -1)
+        sed -i 's/scram-sha-256/md5/g' "$PG_HBA"
+        systemctl reload postgresql
+      args:
+        executable: /bin/bash
 
-    - name: Remove default Nginx site
-      file:
-        path: /etc/nginx/sites-enabled/default
-        state: absent
+    - name: Create PostgreSQL database
+      when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};"
+      args:
+        executable: /bin/bash
 
+    - name: Create PostgreSQL user
+      when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
+      shell: |
+        sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH ENCRYPTED PASSWORD '{{ db_password }}';" || true
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};" || true
+      args:
+        executable: /bin/bash
 
-    # ── App directory ─────────────────────────────────────────────────────────
-    - name: Create app directory
+    - name: Install MySQL
+      when: install_db | default('') == 'true' and db_type | default('') == 'mysql'
+      apt:
+        name:
+          - mysql-server
+        state: present
+
+    - name: Ensure MySQL is started
+      when: install_db | default('') == 'true' and db_type | default('') == 'mysql'
+      systemd:
+        name: mysql
+        state: started
+        enabled: yes
+
+    - name: Configure MySQL database and user
+      when: install_db | default('') == 'true' and db_type | default('') == 'mysql'
+      shell: |
+        mysql -e "CREATE DATABASE IF NOT EXISTS {{ db_name }};"
+        mysql -e "CREATE USER IF NOT EXISTS '{{ db_username }}'@'localhost' IDENTIFIED BY '{{ db_password }}';"
+        mysql -e "GRANT ALL ON {{ db_name }}.* TO '{{ db_username }}'@'localhost';"
+        mysql -e "FLUSH PRIVILEGES;"
+      args:
+        executable: /bin/bash
+
+    - name: Install MongoDB
+      when: install_db | default('') == 'true' and db_type | default('') == 'mongodb'
+      apt:
+        name:
+          - mongodb-org
+        state: present
+
+    - name: Ensure MongoDB is started
+      when: install_db | default('') == 'true' and db_type | default('') == 'mongodb'
+      systemd:
+        name: mongod
+        state: started
+        enabled: yes
+
+    - name: Initialize MongoDB collection
+      when: install_db | default('') == 'true' and db_type | default('') == 'mongodb'
+      shell: |
+        mongosh --eval 'db.getSiblingDB("{{ db_name }}").createCollection("init")'
+      args:
+        executable: /bin/bash
+
+    - name: Ensure app directory exists
       file:
         path: "{{ app_dir }}"
         state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
         mode: '0755'
 
-    - name: Copy application files
-      copy:
-        src: ../
-        dest: "{{ app_dir }}/"
-        mode: preserve
-      notify: Restart app
+    - name: Check if git repo already exists
+      stat:
+        path: "{{ app_dir }}/.git"
+      register: git_repo
 
-    - name: Create Python virtual environment
+    - name: Clone application repository
+      when: not git_repo.stat.exists
+      become_user: "{{ app_user }}"
+      git:
+        repo: "{{ repo_url | default('') }}"
+        dest: "{{ app_dir }}"
+        version: "{{ repo_branch | default('main') }}"
+        force: yes
+      ignore_errors: yes
+
+    - name: Pull latest code if repo exists
+      when: git_repo.stat.exists
+      become_user: "{{ app_user }}"
       shell: |
-        PY=$(command -v python{{ python_version }} 2>/dev/null || command -v python3)
-        $PY -m venv {{ app_dir }}/venv
+        cd {{ app_dir }} && git pull origin {{ repo_branch | default('main') }}
       args:
         executable: /bin/bash
-        creates: "{{ app_dir }}/venv"
+      ignore_errors: yes
 
-    - name: Install Python dependencies
-      shell: |
-        {{ app_dir }}/venv/bin/pip install --upgrade pip -q
-        {{ app_dir }}/venv/bin/pip install -r {{ app_dir }}/requirements.txt -q
-      args:
-        executable: /bin/bash
-    - name: Create .env file
+    - name: Write .env file using shell to handle empty vars safely
       shell: |
         printf '' > {{ app_dir }}/.env
-        printf 'PORT={{ app_port }}\nAPP_ENV=production\n' >> {{ app_dir }}/.env
+        [ -n "{{ database_url | default('') }}" ] && echo "DATABASE_URL={{ database_url }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ mongo_uri | default('') }}" ] && echo "MONGO_URI={{ mongo_uri }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ db_host | default('') }}" ] && echo "DB_HOST={{ db_host }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ db_port | default('') }}" ] && echo "DB_PORT={{ db_port }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ db_name | default('') }}" ] && echo "DB_NAME={{ db_name }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ db_user | default('') }}" ] && echo "DB_USER={{ db_user }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ db_username | default('') }}" ] && echo "DB_USERNAME={{ db_username }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ db_password | default('') }}" ] && echo "DB_PASSWORD={{ db_password }}" >> {{ app_dir }}/.env || true
+        echo "PORT={{ app_port }}" >> {{ app_dir }}/.env
       args:
         executable: /bin/bash
 
-    - name: Enable persistent journald storage
-      # Default Storage=auto can drop short-lived service logs on fresh systems.
-      # Persistent storage means journalctl -u app retains the worker traceback
-      # that we need to diagnose startup failures.
+    - name: Set .env file ownership
       file:
-        path: /var/log/journal
-        state: directory
-        mode: '0755'
+        path: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0600'
 
-    - name: Reload journald with persistent storage
-      shell: systemctl restart systemd-journald
+    - name: Create Python virtual environment
+      become_user: "{{ app_user }}"
+      shell: python3.11 -m venv {{ app_dir }}/.venv
+      args:
+        creates: "{{ app_dir }}/.venv/bin/activate"
+
+    - name: Upgrade pip in virtualenv
+      become_user: "{{ app_user }}"
+      shell: |
+        {{ app_dir }}/.venv/bin/pip install --upgrade pip
       args:
         executable: /bin/bash
 
-    - name: Create systemd service
+    - name: Install Python dependencies
+      become_user: "{{ app_user }}"
+      shell: |
+        {{ app_dir }}/.venv/bin/pip install -r {{ app_dir }}/requirements.txt
+      args:
+        executable: /bin/bash
+
+    - name: Install gunicorn and uvicorn in virtualenv
+      become_user: "{{ app_user }}"
+      shell: |
+        {{ app_dir }}/.venv/bin/pip install gunicorn uvicorn[standard]
+      args:
+        executable: /bin/bash
+
+    - name: Create systemd service for FastAPI app
       copy:
-        dest: /etc/systemd/system/app.service
+        dest: /etc/systemd/system/testweb1.service
         content: |
           [Unit]
-          Description={{ project }} FastAPI app
+          Description=testweb1 Python FastAPI Application
           After=network.target
+
           [Service]
-          User=root
+          Type=simple
+          User={{ app_user }}
           WorkingDirectory={{ app_dir }}
           EnvironmentFile={{ app_dir }}/.env
-          ExecStart={{ app_dir }}/venv/bin/gunicorn {{ entrypoint }} \
-            --workers 2 --worker-class uvicorn.workers.UvicornWorker \
-            --bind 0.0.0.0:{{ app_port }} --timeout 120 \
-            --access-logfile - --error-logfile - --log-level info
-          StandardOutput=journal
-          StandardError=journal
+          ExecStart={{ app_dir }}/.venv/bin/gunicorn {{ gunicorn_entrypoint }} \
+            -k uvicorn.workers.UvicornWorker \
+            -w {{ gunicorn_workers }} \
+            -b 0.0.0.0:{{ app_port }}
           Restart=always
           RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=testweb1
 
           [Install]
           WantedBy=multi-user.target
+        owner: root
+        group: root
+        mode: '0644'
 
-    - name: Enable and start app service
+    - name: Reload systemd daemon
       systemd:
-        name: app
-        enabled: yes
-        state: started
         daemon_reload: yes
 
-    - name: Reload and start web server
-      service:
-        name: "{{ 'apache2' if (web_server or 'nginx').lower() == 'apache' else 'nginx' }}"
-        state: reloaded
+    - name: Enable and start testweb1 service
+      systemd:
+        name: testweb1
+        state: restarted
         enabled: yes
 
-  handlers:
-    - name: Restart app
+    - name: Configure Nginx as reverse proxy
+      copy:
+        dest: /etc/nginx/sites-available/default
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+
+              server_name _;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_cache_bypass $http_upgrade;
+                  proxy_read_timeout 300;
+                  proxy_connect_timeout 300;
+              }
+          }
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Ensure Nginx is enabled and restarted
       systemd:
-        name: app
+        name: nginx
         state: restarted
+        enabled: yes
+
+    - name: Wait for application to be ready on port 8000
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        timeout: 120
+        delay: 10
+      register: app_ready
+      ignore_errors: yes
+
+    - name: Show journalctl logs if app did not start
+      when: app_ready is failed
+      shell: journalctl -u testweb1 --no-pager -n 50
+      register: journal_output
+      args:
+        executable: /bin/bash
+
+    - name: Print journal logs on failure
+      when: app_ready is failed
+      debug:
+        msg: "{{ journal_output.stdout_lines }}"
+
+    - name: Fail if application did not start
+      when: app_ready is failed
+      fail:
+        msg: "Application failed to start on port {{ app_port }}. Check journalctl logs above."
+
+    - name: Print deployment success message
+      debug:
+        msg: "server_ip={{ ansible_host }}"

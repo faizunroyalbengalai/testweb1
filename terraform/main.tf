@@ -1,39 +1,47 @@
 terraform {
-  backend "s3" {
-    encrypt = true
-  }
   required_providers {
     aws = {
-      source = "hashicorp/aws"
-      # Pin below 5.83 — that release introduced `password_wo` for
-      # aws_db_instance and changed plan-time behavior so the literal
-      # `password` argument no longer shows in the plan output and is
-      # treated as if `manage_master_user_password = true`. Result was
-      # an opaque "Invalid master password" error at apply time even
-      # when DB_PASSWORD was correctly populated.
-      # 5.82.x is the last release with the predictable password=... behavior.
-      version = ">= 5.0.0, < 5.83.0"
+      source  = "hashicorp/aws"
+      version = "< 5.83.0"
     }
   }
+  backend "s3" {}
 }
 
 provider "aws" {
-  region = var.aws_region
+  region = "us-east-1"
+}
+
+variable "public_key" {
+  description = "SSH public key for EC2 access"
+  type        = string
+}
+
+variable "instance_type" {
+  description = "EC2 instance type"
+  type        = string
+  default     = "t3.micro"
 }
 
 variable "project_name" {
-  type = string
+  description = "Project name for tagging"
+  type        = string
+  default     = "testweb1"
 }
-variable "aws_region" {
-  type    = string
-  default = "us-east-1"
-}
-variable "public_key" {
-  type = string
-}
-variable "instance_type" {
-  type    = string
-  default = "t3.micro"
+
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
 }
 
 data "aws_vpc" "default" {
@@ -45,99 +53,107 @@ data "aws_subnets" "default" {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
   }
-  filter {
-    name   = "availabilityZone"
-    values = ["${var.aws_region}a", "${var.aws_region}b", "${var.aws_region}c"]
-  }
-}
-
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"]
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-*-22.04-amd64-server-*"]
-  }
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
 }
 
 resource "aws_key_pair" "deployer" {
-  key_name   = "${var.project_name}-key"
+  key_name   = "${var.project_name}-deployer-key"
   public_key = var.public_key
+
   lifecycle {
     ignore_changes = [public_key]
   }
 }
 
-resource "aws_security_group" "sg" {
-  name        = "${var.project_name}-sg"
-  description = "UDAP managed"
+resource "aws_security_group" "app_sg" {
+  name        = "${var.project_name}-app-sg"
+  description = "Security group for ${var.project_name} EC2 instance"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
+    description = "SSH"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
   ingress {
+    description = "HTTP"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
   ingress {
+    description = "HTTPS"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
   ingress {
+    description = "App port"
     from_port   = 8000
     to_port     = 8000
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
   lifecycle {
     create_before_destroy = true
   }
+
   tags = {
-    Project   = var.project_name
-    ManagedBy = "udap"
+    Name    = "${var.project_name}-app-sg"
+    Project = var.project_name
   }
 }
 
-resource "aws_instance" "server" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_type
-  key_name               = aws_key_pair.deployer.key_name
-  subnet_id              = tolist(data.aws_subnets.default.ids)[0]
-  vpc_security_group_ids = [aws_security_group.sg.id]
+resource "aws_instance" "app" {
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = var.instance_type
+  key_name                    = aws_key_pair.deployer.key_name
+  subnet_id                   = tolist(data.aws_subnets.default.ids)[0]
+  vpc_security_group_ids      = [aws_security_group.app_sg.id]
+  associate_public_ip_address = true
 
   root_block_device {
-    volume_size = 20
-    volume_type = "gp3"
+    volume_size           = 20
+    volume_type           = "gp3"
+    delete_on_termination = true
   }
 
   tags = {
-    Name      = var.project_name
-    Project   = var.project_name
-    ManagedBy = "udap"
+    Name    = "${var.project_name}-app"
+    Project = var.project_name
   }
+}
+
+output "instance_id" {
+  description = "EC2 instance ID"
+  value       = aws_instance.app.id
 }
 
 output "public_ip" {
-  value = aws_instance.server.public_ip
+  description = "Public IP address of the EC2 instance"
+  value       = aws_instance.app.public_ip
 }
-output "instance_id" {
-  value = aws_instance.server.id
+
+output "public_dns" {
+  description = "Public DNS name of the EC2 instance"
+  value       = aws_instance.app.public_dns
+}
+
+output "ssh_command" {
+  description = "SSH command to connect to the instance"
+  value       = "ssh -i <private-key> ubuntu@${aws_instance.app.public_ip}"
 }
